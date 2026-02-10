@@ -125,6 +125,67 @@ struct LookinMCPApp {
                     ]),
                     annotations: .init(readOnlyHint: true, openWorldHint: false)
                 ),
+                Tool(
+                    name: "lookin_modify",
+                    description: "Modify a view property by friendly name. Supports: hidden, alpha, frame, bounds, backgroundColor, cornerRadius, text, fontSize, textColor, borderWidth, borderColor, shadowColor, shadowOpacity, shadowRadius, contentMode, tintColor, tag, numberOfLines, textAlignment, enabled, selected, stackAxis, stackSpacing, contentOffset, contentSize, and more. Use lookin_modify with attribute='help' to see all available attributes and value formats.",
+                    inputSchema: .object([
+                        "type": .string("object"),
+                        "properties": .object([
+                            "oid": .object([
+                                "type": .string("integer"),
+                                "description": .string("The OID of the view to modify. Get this from lookin_hierarchy or lookin_search.")
+                            ]),
+                            "attribute": .object([
+                                "type": .string("string"),
+                                "description": .string("The attribute name to modify (e.g. 'hidden', 'alpha', 'backgroundColor', 'text'). Use 'help' to list all available attributes.")
+                            ]),
+                            "value": .object([
+                                "type": .string("string"),
+                                "description": .string("The new value as a string. Format depends on attribute type: booleans as 'true'/'false', colors as '#RRGGBB' or 'r,g,b,a', rects as 'x,y,w,h', etc.")
+                            ])
+                        ]),
+                        "required": .array([.string("oid"), .string("attribute"), .string("value")])
+                    ]),
+                    annotations: .init(readOnlyHint: false, destructiveHint: true, openWorldHint: false)
+                ),
+                Tool(
+                    name: "lookin_invoke",
+                    description: "Call a zero-argument method on a view or layer. Useful for triggering actions like setNeedsLayout, setNeedsDisplay, layoutIfNeeded, removeFromSuperview, etc. Only methods with no arguments are supported.",
+                    inputSchema: .object([
+                        "type": .string("object"),
+                        "properties": .object([
+                            "oid": .object([
+                                "type": .string("integer"),
+                                "description": .string("The OID of the view to invoke the method on.")
+                            ]),
+                            "selector": .object([
+                                "type": .string("string"),
+                                "description": .string("The selector name to invoke (e.g. 'setNeedsLayout', 'layoutIfNeeded', 'setNeedsDisplay'). Must be a zero-argument method.")
+                            ])
+                        ]),
+                        "required": .array([.string("oid"), .string("selector")])
+                    ]),
+                    annotations: .init(readOnlyHint: false, destructiveHint: true, openWorldHint: false)
+                ),
+                Tool(
+                    name: "lookin_selectors",
+                    description: "List available method selectors for a given class name. Returns methods sorted by name length. Use this to discover what methods can be called via lookin_invoke.",
+                    inputSchema: .object([
+                        "type": .string("object"),
+                        "properties": .object([
+                            "className": .object([
+                                "type": .string("string"),
+                                "description": .string("The class name to list selectors for (e.g. 'UIView', 'UILabel', 'UIButton').")
+                            ]),
+                            "hasArg": .object([
+                                "type": .string("boolean"),
+                                "description": .string("If false (default), only return zero-argument selectors. If true, return all selectors.")
+                            ])
+                        ]),
+                        "required": .array([.string("className")])
+                    ]),
+                    annotations: .init(readOnlyHint: true, openWorldHint: false)
+                ),
             ])
         }
 
@@ -305,6 +366,103 @@ struct LookinMCPApp {
                     return CallTool.Result(content: [.text(text)])
                 } catch {
                     return CallTool.Result(content: [.text("Failed to get subtree: \(error.localizedDescription)")], isError: true)
+                }
+
+            case "lookin_modify":
+                guard let mgr = session.requestManager else {
+                    return CallTool.Result(content: [.text("Not connected. Use lookin_connect first.")], isError: true)
+                }
+                guard let attribute = params.arguments?["attribute"]?.stringValue else {
+                    return CallTool.Result(content: [.text("Missing required parameter 'attribute'.")], isError: true)
+                }
+
+                // Special case: help
+                if attribute.lowercased() == "help" {
+                    return CallTool.Result(content: [.text(AttributeRegistry.helpText)])
+                }
+
+                guard let oidValue = params.arguments?["oid"]?.intValue else {
+                    return CallTool.Result(content: [.text("Missing required parameter 'oid'.")], isError: true)
+                }
+                guard let valueStr = params.arguments?["value"]?.stringValue else {
+                    return CallTool.Result(content: [.text("Missing required parameter 'value'.")], isError: true)
+                }
+                let viewOid = UInt(oidValue)
+
+                guard let mapping = AttributeRegistry.mappings[attribute] else {
+                    return CallTool.Result(content: [.text("Unknown attribute '\(attribute)'. Use attribute='help' to see available attributes.")], isError: true)
+                }
+
+                // Determine the target OID: view OID vs layer OID
+                var targetOid = viewOid
+                if !mapping.isViewProperty {
+                    // Need layer OID - look up from cached hierarchy
+                    if let hierarchy = session.cachedHierarchy,
+                       let item = HierarchyFormatter.findItem(in: hierarchy, viewOid: viewOid),
+                       let layerObj = item.layerObject {
+                        targetOid = layerObj.oid
+                    }
+                    // If no cached hierarchy, the view OID might work (the server
+                    // resolves it), but layer OID is more reliable.
+                }
+
+                do {
+                    let parsedValue = try AttributeRegistry.parseValue(valueStr, attrType: mapping.attrType)
+                    let result = try await mgr.modifyAttribute(
+                        targetOid: targetOid,
+                        setter: mapping.setter,
+                        attrType: mapping.attrType,
+                        value: parsedValue
+                    )
+                    // Invalidate caches since the view tree may have changed visually
+                    session.cachedTextContentMap = nil
+                    return CallTool.Result(content: [.text(result)])
+                } catch {
+                    return CallTool.Result(content: [.text("Failed to modify '\(attribute)': \(error.localizedDescription)")], isError: true)
+                }
+
+            case "lookin_invoke":
+                guard let mgr = session.requestManager else {
+                    return CallTool.Result(content: [.text("Not connected. Use lookin_connect first.")], isError: true)
+                }
+                guard let oidValue = params.arguments?["oid"]?.intValue else {
+                    return CallTool.Result(content: [.text("Missing required parameter 'oid'.")], isError: true)
+                }
+                guard let selector = params.arguments?["selector"]?.stringValue, !selector.isEmpty else {
+                    return CallTool.Result(content: [.text("Missing required parameter 'selector'.")], isError: true)
+                }
+                // Validate: no colon means zero args (unless it's a simple property getter)
+                if selector.contains(":") {
+                    return CallTool.Result(content: [.text("Only zero-argument methods are supported. '\(selector)' contains ':' which indicates it takes arguments.")], isError: true)
+                }
+                let oid = UInt(oidValue)
+                do {
+                    let result = try await mgr.invokeMethod(oid: oid, selectorName: selector)
+                    return CallTool.Result(content: [.text(result)])
+                } catch {
+                    return CallTool.Result(content: [.text("Failed to invoke '\(selector)': \(error.localizedDescription)")], isError: true)
+                }
+
+            case "lookin_selectors":
+                guard let mgr = session.requestManager else {
+                    return CallTool.Result(content: [.text("Not connected. Use lookin_connect first.")], isError: true)
+                }
+                guard let className = params.arguments?["className"]?.stringValue, !className.isEmpty else {
+                    return CallTool.Result(content: [.text("Missing required parameter 'className'.")], isError: true)
+                }
+                let hasArg = params.arguments?["hasArg"]?.boolValue ?? false
+                do {
+                    let selectors = try await mgr.fetchAllSelectorNames(className: className, hasArg: hasArg)
+                    if selectors.isEmpty {
+                        return CallTool.Result(content: [.text("No selectors found for class '\(className)'.")])
+                    }
+                    let header = hasArg
+                        ? "All selectors for \(className) (\(selectors.count)):"
+                        : "Zero-argument selectors for \(className) (\(selectors.count)):"
+                    let text = header + "\n" + selectors.joined(separator: "\n")
+                    return CallTool.Result(content: [.text(text)])
+                } catch {
+                    return CallTool.Result(content: [.text("Failed to fetch selectors for '\(className)': \(error.localizedDescription)")], isError: true)
                 }
 
             default:

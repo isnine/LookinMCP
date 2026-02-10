@@ -38,6 +38,9 @@
 #import "../LookinAttributesSection.h"
 #import "../LookinAttribute.h"
 
+// Attribute modification (request type 204)
+#import "../LookinAttributeModification.h"
+
 // Async update tasks
 #import "../LookinStaticAsyncUpdateTask.h"
 
