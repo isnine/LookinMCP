@@ -128,4 +128,68 @@ final class RequestManager: @unchecked Sendable {
         }
         return groups
     }
+
+    /// Known attribute identifiers for text content.
+    private static let textAttrIdentifiers: Set<String> = [
+        "lb_t_t",   // LookinAttr_UILabel_Text_Text
+        "tf_t_t",   // LookinAttr_UITextField_Text_Text
+        "tf_p_p",   // LookinAttr_UITextField_Placeholder_Placeholder
+        "te_t_t",   // LookinAttr_UITextView_Text_Text
+    ]
+
+    /// Extract text content from attribute groups by looking for known text attribute identifiers.
+    private static func extractText(from groups: [LookinAttributesGroup]) -> String? {
+        var texts: [String] = []
+        for group in groups {
+            for section in group.attrSections ?? [] {
+                for attr in section.attributes ?? [] {
+                    guard let identifier = attr.identifier,
+                          textAttrIdentifiers.contains(identifier),
+                          let str = attr.value as? String,
+                          !str.isEmpty else { continue }
+                    texts.append(str)
+                }
+            }
+        }
+        return texts.isEmpty ? nil : texts.joined(separator: " | ")
+    }
+
+    /// Fetch text content for multiple views concurrently.
+    /// Returns a map from view OID to the combined text content string.
+    /// Individual fetch failures are silently skipped.
+    func fetchTextContentMap(for views: [(viewOid: UInt, layerOid: UInt)]) async -> [UInt: String] {
+        guard !views.isEmpty else { return [:] }
+
+        // Use TaskGroup for concurrent fetching with a concurrency limit via chunking.
+        // Each request goes through a single TCP connection so we limit concurrency
+        // to avoid overwhelming the connection.
+        let maxConcurrency = 10
+        var resultMap: [UInt: String] = [:]
+
+        for chunkStart in stride(from: 0, to: views.count, by: maxConcurrency) {
+            let chunkEnd = min(chunkStart + maxConcurrency, views.count)
+            let chunk = Array(views[chunkStart..<chunkEnd])
+
+            await withTaskGroup(of: (UInt, String?).self) { group in
+                for view in chunk {
+                    group.addTask {
+                        do {
+                            let groups = try await self.fetchAllAttrGroups(oid: view.layerOid)
+                            let text = RequestManager.extractText(from: groups)
+                            return (view.viewOid, text)
+                        } catch {
+                            return (view.viewOid, nil)
+                        }
+                    }
+                }
+                for await (viewOid, text) in group {
+                    if let text = text {
+                        resultMap[viewOid] = text
+                    }
+                }
+            }
+        }
+
+        return resultMap
+    }
 }

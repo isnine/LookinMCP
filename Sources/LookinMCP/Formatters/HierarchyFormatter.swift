@@ -15,16 +15,17 @@ enum HierarchyFormatter {
         return lines.joined(separator: "\n")
     }
 
-    /// Search the hierarchy for nodes whose class name or VC name contains `query` (case-insensitive).
+    /// Search the hierarchy for nodes whose class name, VC name, custom title, special trace,
+    /// or text content contains `query` (case-insensitive).
     /// Returns a flat, numbered list so the AI can pick from the results without token-heavy subtrees.
-    static func searchFlat(_ hierarchy: LookinHierarchyInfo, query: String) -> String {
+    static func searchFlat(_ hierarchy: LookinHierarchyInfo, query: String, textContentMap: [UInt: String] = [:]) -> String {
         guard let items = hierarchy.displayItems, !items.isEmpty else {
             return "(empty hierarchy)"
         }
         let q = query.lowercased()
-        var matches: [(className: String, oid: UInt, frame: NSRect, vcName: String?)] = []
+        var matches: [(className: String, oid: UInt, frame: NSRect, vcName: String?, text: String?, customTitle: String?)] = []
         for item in items {
-            collectAllMatches(item, query: q, results: &matches)
+            collectAllMatches(item, query: q, textContentMap: textContentMap, results: &matches)
         }
         if matches.isEmpty {
             return "No views found matching \"\(query)\"."
@@ -38,9 +39,51 @@ enum HierarchyFormatter {
             if let vc = m.vcName {
                 line += " vc=\(vc)"
             }
+            if let title = m.customTitle {
+                line += " title=\"\(title)\""
+            }
+            if let text = m.text {
+                line += " text=\"\(text)\""
+            }
             lines.append(line)
         }
         return lines.joined(separator: "\n")
+    }
+
+    /// Collect OIDs of all text-bearing views (UILabel, UITextField, UITextView) from the hierarchy.
+    /// These are the views whose text content should be fetched for text search.
+    static func collectTextBearingOids(_ hierarchy: LookinHierarchyInfo) -> [(viewOid: UInt, layerOid: UInt)] {
+        guard let items = hierarchy.displayItems else { return [] }
+        var results: [(viewOid: UInt, layerOid: UInt)] = []
+        for item in items {
+            collectTextBearingOidsRecursive(item, results: &results)
+        }
+        return results
+    }
+
+    private static let textBearingClasses: Set<String> = ["UILabel", "UITextField", "UITextView"]
+
+    private static func collectTextBearingOidsRecursive(
+        _ item: LookinDisplayItem,
+        results: inout [(viewOid: UInt, layerOid: UInt)]
+    ) {
+        // Check the full class chain, not just the first class name.
+        // e.g. UIButtonLabel has chain [UIButtonLabel, UILabel, UIView] —
+        // we need to detect that UILabel is in the chain.
+        let classChain = item.viewObject?.classChainList
+            ?? item.layerObject?.classChainList
+            ?? []
+        let isTextBearing = classChain.contains(where: { textBearingClasses.contains($0) })
+        if isTextBearing {
+            let viewOid = item.viewObject?.oid ?? item.layerObject?.oid ?? 0
+            let layerOid = item.layerObject?.oid ?? viewOid
+            if viewOid != 0 {
+                results.append((viewOid: viewOid, layerOid: layerOid))
+            }
+        }
+        for child in item.subitems ?? [] {
+            collectTextBearingOidsRecursive(child, results: &results)
+        }
     }
 
     /// Find the node with the given OID and format it + its full subtree.
@@ -68,20 +111,37 @@ enum HierarchyFormatter {
     private static func collectAllMatches(
         _ item: LookinDisplayItem,
         query: String,
-        results: inout [(className: String, oid: UInt, frame: NSRect, vcName: String?)]
+        textContentMap: [UInt: String],
+        results: inout [(className: String, oid: UInt, frame: NSRect, vcName: String?, text: String?, customTitle: String?)]
     ) {
         let className = item.viewObject?.classChainList?.first
             ?? item.layerObject?.classChainList?.first
             ?? "Unknown"
         let vcName = item.hostViewControllerObject?.classChainList?.first
+        let customTitle = item.customDisplayTitle
+        let specialTrace = item.viewObject?.specialTrace
+        let oid = item.viewObject?.oid ?? item.layerObject?.oid ?? 0
+        let textContent = textContentMap[oid]
 
-        if className.lowercased().contains(query) || (vcName?.lowercased().contains(query) ?? false) {
-            let oid = item.viewObject?.oid ?? item.layerObject?.oid ?? 0
-            results.append((className: className, oid: oid, frame: item.frame, vcName: vcName))
+        let matched = className.lowercased().contains(query)
+            || (vcName?.lowercased().contains(query) ?? false)
+            || (customTitle?.lowercased().contains(query) ?? false)
+            || (specialTrace?.lowercased().contains(query) ?? false)
+            || (textContent?.lowercased().contains(query) ?? false)
+
+        if matched {
+            results.append((
+                className: className,
+                oid: oid,
+                frame: item.frame,
+                vcName: vcName,
+                text: textContent,
+                customTitle: customTitle
+            ))
         }
         // Always recurse — a child might also match independently
         for child in item.subitems ?? [] {
-            collectAllMatches(child, query: query, results: &results)
+            collectAllMatches(child, query: query, textContentMap: textContentMap, results: &results)
         }
     }
 

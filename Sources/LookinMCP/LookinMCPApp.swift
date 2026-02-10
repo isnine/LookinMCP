@@ -9,6 +9,9 @@ private final class SessionState: @unchecked Sendable {
     var requestManager: RequestManager?
     /// Used by lookin_view_detail to look up the layer OID from a view OID.
     var cachedHierarchy: LookinHierarchyInfo?
+    /// Cached text content map: view OID -> text string (e.g. UILabel.text, UITextField.text).
+    /// Populated on first search and invalidated when hierarchy is re-fetched.
+    var cachedTextContentMap: [UInt: String]?
 }
 
 @main
@@ -94,13 +97,13 @@ struct LookinMCPApp {
                 ),
                 Tool(
                     name: "lookin_search",
-                    description: "Fuzzy-search the view hierarchy by class name or view controller name (case-insensitive substring match). Returns a flat numbered list of matching nodes with class name, OID, frame, and VC. Use lookin_subtree to expand a specific result.",
+                    description: "Fuzzy-search the view hierarchy by class name, view controller name, or text content such as UILabel text, UIButton title label, UITextField text/placeholder (case-insensitive substring match). Returns a flat numbered list of matching nodes with class name, OID, frame, VC, and text. Use lookin_subtree to expand a specific result.",
                     inputSchema: .object([
                         "type": .string("object"),
                         "properties": .object([
                             "query": .object([
                                 "type": .string("string"),
-                                "description": .string("Substring to match against view class names and view controller names (case-insensitive). Example: 'Message', 'Label', 'TableView'.")
+                                "description": .string("Substring to match against view class names, view controller names, and text content (case-insensitive). Example: 'Reorder', 'Submit', 'Label', 'TableView'.")
                             ])
                         ]),
                         "required": .array([.string("query")])
@@ -169,6 +172,7 @@ struct LookinMCPApp {
                 session.connection = nil
                 session.requestManager = nil
                 session.cachedHierarchy = nil
+                session.cachedTextContentMap = nil
                 return CallTool.Result(content: [.text("Disconnected.")])
 
             case "lookin_ping":
@@ -210,6 +214,7 @@ struct LookinMCPApp {
                 do {
                     let hierarchy = try await mgr.fetchHierarchy()
                     session.cachedHierarchy = hierarchy
+                    session.cachedTextContentMap = nil  // invalidate text cache when hierarchy changes
                     let text = HierarchyFormatter.format(hierarchy)
                     return CallTool.Result(content: [.text(text)])
                 } catch {
@@ -259,8 +264,20 @@ struct LookinMCPApp {
                     } else {
                         hierarchy = try await mgr.fetchHierarchy()
                         session.cachedHierarchy = hierarchy
+                        session.cachedTextContentMap = nil  // invalidate text cache with new hierarchy
                     }
-                    let text = HierarchyFormatter.searchFlat(hierarchy, query: query)
+
+                    // Fetch text content for all text-bearing views (cached after first fetch)
+                    let textContentMap: [UInt: String]
+                    if let cached = session.cachedTextContentMap {
+                        textContentMap = cached
+                    } else {
+                        let textBearingViews = HierarchyFormatter.collectTextBearingOids(hierarchy)
+                        textContentMap = await mgr.fetchTextContentMap(for: textBearingViews)
+                        session.cachedTextContentMap = textContentMap
+                    }
+
+                    let text = HierarchyFormatter.searchFlat(hierarchy, query: query, textContentMap: textContentMap)
                     return CallTool.Result(content: [.text(text)])
                 } catch {
                     return CallTool.Result(content: [.text("Failed to search hierarchy: \(error.localizedDescription)")], isError: true)
